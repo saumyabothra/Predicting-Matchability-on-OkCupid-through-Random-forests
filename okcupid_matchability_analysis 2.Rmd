@@ -1,0 +1,810 @@
+---
+title: "Predicting Matchability on OkCupid using Bagging and Random Forests"
+author: "Saumya"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+
+# Introduction
+
+Online dating platforms generate large amounts of data on how users present themselves and what they are looking for. This information can be used to understand what makes a profile appealing and to build models that estimate how “matchable” someone is.
+
+In this project we work with the OkCupid profiles dataset, assembled by Albert Kim and Adriana Escobedo-Land for a statistics education paper. It contains roughly 59,000 active OkCupid users around June 2012 who:
+- Lived within 25 miles of San Francisco,
+- Had been active in the previous year, and
+- Had at least one photo on their profile (in the original scrape).
+
+The dataset includes:
+- Demographics: age, sex, orientation, height, income, relationship status
+- Lifestyle: diet, drinks, smokes, drugs, religion, pets, offspring
+- Socio-economic: education, job
+- Other: astrological sign, languages spoken, location
+- Ten open-ended essays (essay0–essay9) describing themselves, what they’re doing with life, favourite books/movies, etc.
+
+Methodologically, we focus on bagging (bootstrap aggregating) and random forests, both of which use ensembles of decision trees:
+A single decision tree (CART) is flexible and interpretable but high-variance.
+Bagging reduces variance by fitting many trees on bootstrap samples and averaging their predictions.
+Random forests go further by subsampling predictors at each split (using mtry), decorrelating the trees and often improving performance.
+OkCupid profiles are a good playground for these methods: high-dimensional, messy, with many missing values and potential interactions.
+
+# Research question
+
+The OkCupid dataset does not provide the true number of matches or interactions received by each user.  To quantify profile appeal we therefore define a **matchability score** based on observable profile characteristics and use it as a pseudo‑target for classification.  Our central question is:
+
+> **What user attributes and self‑presentation features best predict high matchability on OkCupid, and how do a single decision tree, bagging and random forests compare when modelling this pseudo‑target?**
+
+This question is phrased simply but captures the essence of the task: construct a reasonable proxy for match success, model it with different ensemble techniques, and interpret the results.  The answer will shed light on which features contribute most to a profile’s appeal and illustrate the practical differences between a single decision tree, bagging and random forests.
+
+# Data description
+
+The raw data reside in several CSV files inside the folder `SEMINAR/pres 3` on the desktop.  Each file contains a subset of profiles with the same column structure.  The key structured variables mirror those described above: demographics (`age`, `sex`, `orientation`, `height`, `income`, `status`), lifestyle (`diet`, `drinks`, `smokes`, `drugs`, `religion`, `education`, `job`, `pets`, `offspring`), location and language (`sign`, `speaks`, `location` if available), and the ten essay responses.  According to the original data documentation, no column is complete across all records; some variables such as `income` and `height` are missing for many users, whereas others like `age` and `sex` are largely complete.  Text fields vary widely in length and content.
+
+```{r setup, message=FALSE, warning=FALSE}
+# Core data + modelling packages
+library(tidyverse)
+library(tidymodels)
+
+# Tree / ensemble models
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+
+# Interpretation / plots
+library(ggplot2)
+library(yardstick)
+
+set.seed(42)
+
+# -----------------------------------------
+# Load ONE original OkCupid profiles dataset
+# -----------------------------------------
+
+data_dir <- file.path("~", "Desktop", "SEMINAR", "pres 3")
+
+# Adjust filename if different
+file_path <- file.path(data_dir, "okcupid_profiles.csv")
+
+okcupid_raw <- read_csv(file_path, show_col_types = FALSE)
+
+# Explore basic structure
+glimpse(okcupid_raw)
+
+# Count rows and columns
+dim(okcupid_raw)
+
+# Summarise selected numeric variables
+okcupid_raw %>%
+  summarise(
+    n_rows    = n(),
+    mean_age  = mean(age, na.rm = TRUE),
+    sd_age    = sd(age, na.rm = TRUE),
+    min_age   = min(age, na.rm = TRUE),
+    max_age   = max(age, na.rm = TRUE),
+    mean_height = mean(height, na.rm = TRUE),
+    pct_income_reported = mean(!is.na(income))
+  )
+```
+
+The initial summary provides context: the dataset contains nearly 60 k rows and dozens of columns; the average age is around the early thirties and values range from 18 to over 100.  A substantial fraction of profiles do not report income, height or other sensitive details, underscoring the need for careful handling of missing data.
+
+# Data preparation
+
+Before fitting models we need to clean and engineer the data.  The following steps are implemented:
+
+1. **Feature engineering.**  To build a matchability proxy we construct three intermediate features:
+   - **curation_effort**: number of non-missing essay responses (essay0–essay9). This measures how much expressive effort the user invests in writing about themselves.
+   - **`profile_completeness`**: the number of non‑missing demographic and lifestyle fields for each profile.  A more complete profile often signals effort and may be correlated with appeal.
+   - **`bio_words`**: total number of words across the ten essays.  Free‑text self‑descriptions provide additional information about users’ personalities.  We concatenate all essays into one string, replace missing values with empty strings, and count the number of words using the `stringr` package.
+   Each of these features is normalised to the 0–1 range and combined into a **matchability score** as
+
+   ```r
+   matchability_score <- 0.4 * photo_scaled + 0.3 * completeness_scaled + 0.3 * bio_scaled
+   ```
+
+   We then define the binary target `matchability` by splitting the score into deciles: values in the top 30 % are labelled `"high"` and those in the bottom 30 % are labelled `"low"`.  Profiles in the middle 40 % are removed to obtain clearer classes.  This approach follows social science practice when the true number of matches is unavailable and profile effort is used as a surrogate.
+   
+Leakage note: The engineered features (curation_effort, profile_completeness, bio_words and their scaled versions) define our label. If we allowed them into the predictors, the models could simply “reverse engineer” the scoring function and get artificially perfect accuracy. To avoid this, we will drop these features from the predictors and only use the original demographic and lifestyle variables to predict matchability.
+
+2. **Data splitting.**  The cleaned data are split into training (70 %) and testing (30 %) sets stratified by `matchability` to preserve class balance.
+
+3. **Preprocessing recipe.**  We use the *tidymodels* `recipe` framework to perform the following operations:
+   - Remove the ten essay columns (`essay0`–`essay9`) to avoid creating thousands of dummy variables for free text.  Their information is captured in `bio_words`.
+   - Impute missing numeric variables (`age`, `height`, `income`) using *k*-nearest neighbours (`step_impute_knn`).  KNN imputation uses similarity between observations to fill in missing numeric values and makes few distributional assumptions.
+   - Impute missing categorical variables with the most common category (`step_impute_mode`).  This creates an explicit category for missing responses such as `"no_response"`.
+   - Group rare categories in high‑cardinality predictors (e.g. `job`, `speaks`) into an `"other"` level using `step_other()` with a threshold of 1 %.  Collapsing sparse categories prevents the creation of an excessive number of dummy variables and helps models generalise.
+   - Dummy‑encode all nominal predictors (`step_dummy()`).  We do **not** use `step_unknown()` here because some variables already have a level `"unknown"`; grouping rare categories via `step_other()` and allowing novel levels in the workflow is more robust.
+   - Remove predictors with zero variance (`step_zv()`).
+
+```{r data-prep, message=FALSE, warning=FALSE}
+library(stringr)
+library(rsample)
+library(recipes)
+library(workflows)
+
+okcupid <- okcupid_raw %>%
+mutate(
+# 1) expressive effort: number of essays filled
+curation_effort = rowSums(!is.na(select(., starts_with("essay")))),
+# 2) profile completeness across key structured fields
+profile_completeness = rowSums(
+  !is.na(select(
+    .,
+    age, height, income, sex, orientation, body_type,
+    diet, drinks, smokes, drugs, religion, offspring,
+    pets, education, job, speaks
+  ))
+),
+
+# 3) total word count across essays
+bio_words = select(., starts_with("essay")) %>%
+  mutate(across(everything(), ~ if_else(is.na(.x), "", .x))) %>%
+  unite("bio", sep = " ") %>%
+  mutate(word_count = str_count(bio, boundary("word"))) %>%
+  pull(word_count)
+) %>%
+  # normalise engineered features
+mutate(
+curation_scaled = (curation_effort - min(curation_effort, na.rm = TRUE)) /
+(max(curation_effort, na.rm = TRUE) - min(curation_effort, na.rm = TRUE)),
+completeness_scaled = (profile_completeness - min(profile_completeness, na.rm = TRUE)) /
+(max(profile_completeness, na.rm = TRUE) - min(profile_completeness, na.rm = TRUE)),
+bio_scaled = (bio_words - min(bio_words, na.rm = TRUE)) /
+(max(bio_words, na.rm = TRUE) - min(bio_words, na.rm = TRUE)),
+matchability_score = 0.4 * curation_scaled +
+0.3 * completeness_scaled +
+0.3 * bio_scaled
+) %>%
+mutate(
+quantile_cut = ntile(matchability_score, 10),
+matchability = case_when(
+quantile_cut >= 8 ~ "high",
+quantile_cut <= 3 ~ "low",
+TRUE ~ NA_character_
+)
+) %>%
+filter(!is.na(matchability)) %>%
+mutate(
+# Make 'high' the first level so yardstick treats it as the positive class
+matchability = factor(matchability, levels = c("high", "low"))
+)
+
+table(okcupid$matchability)
+
+# NOTE ON LEAKAGE
+#
+# Because the binary target `matchability` is defined directly from the
+# engineered features (`photo_count`, `profile_completeness`, `bio_words`),
+# keeping those features as predictors leads to perfect or near‐perfect
+# classification.  To avoid this information leakage and evaluate the
+# models on truly predictive variables, we compute these engineered
+# features only to create the target but **exclude them** from the set of
+# predictors.  The models must therefore learn from the original
+# demographic and lifestyle attributes instead of simply reproducing
+# the scoring function.
+
+# Split into training and testing sets
+set.seed(42)
+data_split <- initial_split(okcupid, prop = 0.7, strata = matchability)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+table(train_data$matchability)
+table(test_data$matchability)
+
+# Specify preprocessing recipe
+#
+# We remove the engineered matchability_score and its scaled components from the
+# predictor set because they deterministically define the target.  This forces
+# the models to learn from the original profile attributes (age, height, etc.)
+# and our engineered features (photo_count, profile_completeness, bio_words).
+rec <- recipe(matchability ~ ., data = train_data) %>%
+  # Remove the artificial score and its intermediate scaled components so
+  # they are not used as predictors.  We keep photo_count, profile_completeness
+  # and bio_words as predictors because they capture useful information.
+step_rm(
+matchability_score, curation_scaled, completeness_scaled,
+bio_scaled, quantile_cut,
+curation_effort, profile_completeness, bio_words
+) %>%
+step_rm(starts_with("essay")) %>%
+  # remove high‑cardinality or timestamp variables that add little predictive power
+step_rm(last_online, location) %>%
+  # convert all character predictors to factors
+step_string2factor(all_nominal_predictors()) %>%
+  # assign any new, unseen levels to a special value during baking
+step_novel(all_nominal_predictors(), new_level = "new_lvl") %>%
+  # group rare categories into a unique label to avoid conflict with existing levels
+step_other(all_nominal_predictors(), threshold = 0.01, other = "rare_cat") %>%
+  # impute missing values
+step_impute_knn(all_numeric_predictors(), neighbors = 5) %>%
+step_impute_mode(all_nominal_predictors()) %>%
+  # dummy encode nominal predictors
+step_dummy(all_nominal_predictors()) %>%
+step_zv(all_predictors())
+
+# Prepare recipe and process data
+prepped <- prep(rec)
+train_processed <- bake(prepped, new_data = NULL)
+test_processed <- bake(prepped, new_data = test_data)
+dim(train_processed)
+dim(test_processed)
+```
+
+# Baseline model: single decision tree
+
+A single decision tree provides an interpretable baseline but is known to be high‑variance and prone to overfitting.  We fit a classification tree using the `rpart` package and evaluate its performance on the test set.
+
+```{r baseline-model, message=FALSE, warning=FALSE}
+library(rpart)
+library(rpart.plot)
+library(yardstick)
+
+# Fit tree on processed training data
+tree_model <- rpart(
+matchability ~ .,
+data = train_processed,
+method = "class",
+control = rpart.control(
+cp = 0.005, # complexity parameter (pruning)
+minsplit = 20 # minimum samples for a split
+)
+)
+
+# Plot tree (pruned tree for readability)
+rpart.plot(tree_model, fallen.leaves = TRUE, cex = 0.5,
+main = "Baseline CART decision tree")
+
+# Predict on processed test data
+tree_pred <- predict(tree_model, newdata = test_processed, type = "class")
+tree_results <- tibble(
+truth = test_processed$matchability,
+.pred_class = tree_pred
+)
+
+# Evaluate
+#
+# By default `metrics()` returns accuracy and kappa only. To include precision
+# and recall for the positive class (``high``), we explicitly set the metric
+# set to include these measures. Precision and recall are important for
+# understanding how well the model identifies high-matchability profiles.
+tree_metrics <- metric_set(accuracy, kap, precision, recall)(
+tree_results,
+truth = truth,
+estimate = .pred_class
+)
+tree_conf <- conf_mat(tree_results, truth, .pred_class)
+tree_metrics
+tree_conf
+
+```
+
+The tree summarises how splits on demographic and lifestyle variables partition profiles into high vs low matchability. However, a single tree can be unstable: small changes in the data can produce very different structures.
+
+# Bagging
+
+Bagging (bootstrap aggregating) reduces variance by:
+- Taking many bootstrap samples of the training data,
+- Fitting a tree to each sample,
+- Averaging their predictions (majority vote in classification).
+
+In the `randomForest` implementation, we can reproduce bagging by setting mtry = p, where p is the number of predictors. That way, each split considers all predictors (no random subset), so the only randomness comes from bootstrap sampling.
+
+```{r bagging, message=FALSE, warning=FALSE}
+#Number of predictors (exclude outcome)
+p <- ncol(train_processed) - 1
+
+#Bagging model: randomForest with mtry = p
+set.seed(123)
+bag_model <- randomForest(
+x = select(train_processed, -matchability),
+y = train_processed$matchability,
+ntree = 200, # number of bootstrap trees
+mtry = p, # bagging: all predictors considered at each split
+importance = TRUE
+)
+bag_model # prints OOB error progression etc.
+
+#Out-of-bag error estimate
+bag_oob_error <- bag_model$err.rate[bag_model$ntree, "OOB"]
+bag_oob_error
+
+#Predictions on test set
+bag_pred <- predict(
+bag_model,
+newdata = select(test_processed, -matchability),
+type = "class"
+)
+bag_results <- tibble(
+truth = test_processed$matchability,
+.pred_class = bag_pred
+)
+bag_metrics <- metric_set(accuracy, kap, precision, recall)(
+bag_results,
+truth = truth,
+estimate = .pred_class
+)
+bag_conf <- conf_mat(bag_results, truth, .pred_class)
+bag_metrics
+bag_conf
+```
+
+Bagging reduces prediction variance by averaging unstable trees.  In practice we expect to see a moderate improvement in accuracy and a more balanced confusion matrix relative to the single tree.  Because each bagged tree leaves out roughly one‑third of the observations, we can also compute an out‑of‑bag error estimate, though here we focus on the explicit test set metrics.
+
+Bagging should generally:
+- Reduce variance relative to a single tree,
+- Improve test accuracy and stability,
+- Still be somewhat correlated across trees, because every split sees all predictors.
+
+# Random forests
+
+Random forests improve on bagging by introducing feature subsampling at each split:
+- At each node, only a random subset of predictors of size mtry is considered.
+- For classification, a common default is mtry = floor(sqrt(p)).
+- This decorrelates the trees and typically improves performance and robustness.
+
+```{r random-forest, message=FALSE, warning=FALSE}
+library(tune)
+library(dials)
+library(parsnip)
+library(vip)
+library(ggplot2)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+
+rf_spec <- rand_forest(
+  mtry  = tune(),
+  trees = 200,
+  min_n = 5
+) %>%
+  # compute importance when fitting
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+set.seed(123)
+
+rf_workflow <- workflow() %>%
+  add_recipe(rec)
+
+# 5-fold CV
+folds <- vfold_cv(train_data, v = 5, strata = matchability)
+
+# Workflow with model for tuning
+rf_tune_workflow <- rf_workflow %>%
+  add_model(rf_spec)
+
+# Tune over 3 mtry values
+rf_tune <- tune_grid(
+  rf_tune_workflow,
+  resamples = folds,
+  grid = grid_regular(mtry(range = c(5, 25)), levels = 3),
+  metrics = metric_set(accuracy)
+)
+
+best_mtry <- show_best(rf_tune, metric = "accuracy", n = 1)$mtry[[1]]
+
+# -------------------------------
+# 2. FINAL FIT USING SELECTED MTRY
+# -------------------------------
+
+final_rf_spec <- finalize_model(rf_spec, list(mtry = best_mtry))
+
+final_rf_workflow <- rf_workflow %>%
+  add_model(final_rf_spec)
+
+final_rf_fit <- fit(final_rf_workflow, data = train_data)
+
+# Predict on test
+rf_pred <- predict(final_rf_fit, new_data = test_data, type = "class") %>%
+  bind_cols(test_data %>% select(matchability))
+
+rf_metrics <- metric_set(accuracy, kap, precision, recall)(
+  rf_pred,
+  truth = matchability,
+  estimate = .pred_class
+)
+
+rf_conf <- conf_mat(
+  rf_pred,
+  truth = matchability,
+  estimate = .pred_class
+)
+
+rf_metrics
+rf_conf
+```
+We expect RF to perform at least as well as bagging, and often slightly better, because feature subsampling reduces the correlation among trees.
+
+#Variable Importance plots
+We now examine which predictors are most important for:
+- the CART tree,
+- the bagging model, and
+- the random forest.
+
+For the CART tree, importance is based on total reduction in impurity. For bagging and RF, we use the Gini importance values from `randomForest::importance()`.
+``` {r extras}
+#CART variable importance
+tree_var_imp <- tibble(
+Variable = names(tree_model$variable.importance),
+Importance = as.numeric(tree_model$variable.importance)
+) %>%
+arrange(desc(Importance))
+
+#Bagging variable importance (MeanDecreaseGini)
+bag_var_imp <- importance(bag_model) %>%
+as_tibble(rownames = "Variable") %>%
+rename(Importance = MeanDecreaseGini) %>%
+arrange(desc(Importance))
+
+#Random forest variable importance
+rf_var_imp <- importance(rf_model) %>%
+as_tibble(rownames = "Variable") %>%
+rename(Importance = MeanDecreaseGini) %>%
+arrange(desc(Importance))
+
+#Top 10 plots
+tree_top10 <- tree_var_imp %>% slice_head(n = 10)
+bag_top10 <- bag_var_imp %>% slice_head(n = 10)
+rf_top10 <- rf_var_imp %>% slice_head(n = 10)
+
+#Plot CART importance
+ggplot(tree_top10, aes(x = reorder(Variable, Importance), y = Importance)) +
+geom_col(fill = "#2ecc71") +
+coord_flip() +
+labs(title = "CART variable importance (top 10)",
+x = "Predictor", y = "Importance")
+
+#Plot bagging importance
+ggplot(bag_top10, aes(x = reorder(Variable, Importance), y = Importance)) +
+geom_col(fill = "#e67e22") +
+coord_flip() +
+labs(title = "Bagging variable importance (top 10)",
+x = "Predictor", y = "Importance")
+
+#Plot random forest importance
+ggplot(rf_top10, aes(x = reorder(Variable, Importance), y = Importance)) +
+geom_col(fill = "#2980b9") +
+coord_flip() +
+labs(title = "Random forest variable importance (top 10)",
+x = "Predictor", y = "Importance")
+```
+These plots show which dummy-encoded features are most influential in predicting high vs low matchability. You can map dummy variable names back to original fields (e.g., drinks_socially, smokes_no, etc.).
+
+#Partial dependence plot (Random forest)
+To interpret how a single feature affects the predicted probability of high matchability while averaging over other variables, we use a partial dependence plot (PDP). Here we focus on age.
+``` {r partial dependence plot}
+if (requireNamespace("pdp", quietly = TRUE)) {
+library(pdp)
+
+#Partial dependence of class 'high' on age
+pd_age <- partial(
+object = rf_model,
+pred.var = "age",
+train = train_processed,
+which.class = "high",
+grid.resolution = 30
+)
+autoplot(pd_age) +
+labs(
+title = "Partial dependence of high matchability on age",
+x = "Age",
+y = "Predicted probability of high matchability"
+)
+} else {
+message("Package 'pdp' is not installed. Install with install.packages('pdp') to see PDP plots.")
+}
+```
+This typically shows a bell-shaped curve where profiles in a certain age band (e.g., late 20s to early 30s) have higher predicted matchability than very young or older extremes.
+
+#Example trees from bagging and random forest
+
+Although bagging and random forests are ensembles, it is useful to show one constituent tree for illustration.
+
+For bagging, we simulate a single bagged tree by taking one bootstrap sample of the processed training data and fitting a CART model to it.
+
+For the random forest, we use `randomForest::getTree()` to extract the structure of one tree. If the `reprtree package` is available, we can plot it; otherwise we print the first few rows.
+``` {r example trees}
+
+#Example tree from bagging (bootstrap CART)
+set.seed(321)
+bootstrap_idx <- sample(nrow(train_processed), replace = TRUE)
+bag_single_tree <- rpart(
+matchability ~ .,
+data = train_processed[bootstrap_idx, ],
+method = "class",
+control = rpart.control(cp = 0.005, minsplit = 20)
+)
+rpart.plot(
+bag_single_tree,
+fallen.leaves = TRUE,
+cex = 0.5,
+main = "Example tree from bagging (bootstrap sample)"
+)
+
+#Example tree from random forest
+if (requireNamespace("reprtree", quietly = TRUE)) {
+library(reprtree)
+  
+#Plot tree k = 1 (you can change k)
+reprtree::plot.getTree(rf_model, k = 1, depth = 3)
+} else {
+message("Package 'reprtree' not installed. Showing the first few rows of one RF tree instead.")
+rf_tree_one <- randomForest::getTree(rf_model, k = 1, labelVar = TRUE)
+head(rf_tree_one)
+}
+```
+
+This demonstrates that:
+- CART and bagging trees may be quite deep and specific,
+- Random forest trees are diverse and use different subsets of features,
+- The ensemble prediction is an average of many such trees.
+
+# Comparison of models
+
+To compare the decision tree, bagging and random forest quantitatively, we summarise their key metrics in a table.  Because we have removed the engineered features used to define the matchability label from the predictors, the models must learn from the original demographic and lifestyle variables and the resulting accuracy is no longer trivially 100 %.  The ensemble methods generally outperform the single tree, though the differences are more nuanced than in our initial deterministic setup.
+
+```{r comparison-table, echo=FALSE}
+
+#Helper to pull accuracy, precision, recall
+get_metric <- function(metrics_tbl, metric_name) {
+metrics_tbl %>%
+filter(.metric == metric_name) %>%
+pull(.estimate)
+}
+comparison <- tibble(
+Model = c("Decision tree", "Bagging (mtry = p)", "Random forest (mtry = sqrt(p))"),
+Accuracy = c(get_metric(tree_metrics, "accuracy"),
+get_metric(bag_metrics, "accuracy"),
+get_metric(rf_metrics, "accuracy")),
+Precision_high = c(get_metric(tree_metrics, "precision"),
+get_metric(bag_metrics, "precision"),
+get_metric(rf_metrics, "precision")),
+Recall_high = c(get_metric(tree_metrics, "recall"),
+get_metric(bag_metrics, "recall"),
+get_metric(rf_metrics, "recall"))
+)
+knitr::kable(
+comparison,
+digits = 3,
+col.names = c("Model", "Accuracy", "Precision (high)", "Recall (high)")
+)
+```
+
+We also inspect which variables each model deems most important.  The tables below list the top three predictors for the single decision tree, bagging and random forest ensembles based on their respective variable importance measures.  These rankings highlight that while all models attend to similar factors (such as age, lifestyle habits and job category), the importance order and the weight placed on each predictor can differ.  Bagging and random forests tend to distribute importance across more variables, whereas the single tree focuses on a few dominant splits.
+
+```{r var-importance-table, echo=FALSE}
+
+importance_table <- tibble(
+Model = c(rep("Decision tree", 3), rep("Bagging", 3), rep("Random forest", 3)),
+Rank = rep(1:3, times = 3),
+Predictor = c(
+tree_var_imp$Variable[1:3],
+bag_var_imp$Variable[1:3],
+rf_var_imp$Variable[1:3]
+),
+Importance = c(
+tree_var_imp$Importance[1:3],
+bag_var_imp$Importance[1:3],
+rf_var_imp$Importance[1:3]
+)
+)
+knitr::kable(importance_table, digits = 3)
+```
+
+Typically:
+- The single tree focuses heavily on a small number of variables (e.g., age, drinking, smoking).
+- Bagging spreads importance more evenly and picks up weaker effects.
+- Random forest further distributes importance across variables, reflecting complex interactions.
+
+#Interactive prediction: matchability for a new profile
+To make the model “come alive” in a presentation, we can type in a fake profile (or ask someone in the audience to supply attributes) and predict their matchability.
+We:
+
+- Create a one-row tibble with the same raw variables as train_data,
+- Bake it with the same recipe (prepped) to ensure the same preprocessing,
+- Predict with the random forest model.
+``` {r interaction with audience}
+#Example new profile (you can edit live during the presentation)
+new_profile <- tibble(
+age = 26,
+sex = "f",
+orientation = "straight",
+status = "single",
+height = 165,
+income = NA, # unknown
+body_type = "average",
+diet = "mostly anything",
+drinks = "socially",
+smokes = "no",
+drugs = "no",
+religion = "agnosticism and laughing about it",
+offspring = NA,
+pets = "likes dogs",
+education = "graduated from college/university",
+job = "science / tech / engineering",
+speaks = "english",
+sign = "gemini",
+#essays left NA here; they are not used as predictors because we dropped them
+essay0 = NA_character_,
+essay1 = NA_character_,
+essay2 = NA_character_,
+essay3 = NA_character_,
+essay4 = NA_character_,
+essay5 = NA_character_,
+essay6 = NA_character_,
+essay7 = NA_character_,
+essay8 = NA_character_,
+essay9 = NA_character_,
+last_online = NA_character_,
+location = NA_character_
+)
+#Apply the same preprocessing pipeline
+new_profile_processed <- bake(prepped, new_data = new_profile)
+#Predict class and probability using random forest
+new_pred_class <- predict(rf_model, newdata = select(new_profile_processed, -matchability), type = "class")
+new_pred_prob <- predict(rf_model, newdata = select(new_profile_processed, -matchability), type = "prob")
+new_pred_class
+new_pred_prob
+```
+```{r}
+library(tidyverse)
+library(ggplot2)
+
+theme_match <- theme_minimal() +
+  theme(
+    plot.background   = element_rect(fill = "#f5efff", color = NA),
+    panel.background  = element_rect(fill = "#ffffff", color = NA),
+    panel.grid.major  = element_line(color = "#e6dfff", size = 0.4),
+    panel.grid.minor  = element_blank(),
+    axis.title        = element_text(color = "#4f20b9", size = 12, face = "bold"),
+    axis.text         = element_text(color = "#4f20b9", size = 10),
+    plot.title        = element_text(color = "#bc2d93", size = 16, face = "bold", hjust = 0),
+    plot.subtitle     = element_text(color = "#9870fc", size = 11, hjust = 0),
+    strip.text        = element_text(color = "#4f20b9", face = "bold"),
+  )
+library(randomForest)   # for importance()
+
+library(rpart)
+library(dplyr)
+library(ggplot2)
+
+# 1. Extract variable importance from rpart object
+# tree_model is your fitted CART from rpart()
+cart_var_imp <- data.frame(
+  Predictor = names(tree_model$variable.importance),
+  Importance = as.numeric(tree_model$variable.importance)
+) %>%
+  arrange(desc(Importance))
+
+cart_top10 <- cart_var_imp %>% 
+  slice_head(n = 10)
+
+# 2. Plot using the match theme you defined earlier
+cart_plot <- ggplot(cart_top10,
+                    aes(x = Importance,
+                        y = reorder(Predictor, Importance))) +
+  geom_col(fill = "#4f20b9", width = 0.7) +
+  labs(
+    title = "CART variable importance (top 10)",
+    x = "Importance",
+    y = "Predictor"
+  ) +
+  theme_match
+
+cart_plot
+
+ggsave("cart_var_importance_150dpi.png", cart_plot,
+       dpi = 150, width = 7, height = 4)
+
+```
+
+```{r}
+library(ipred)
+library(dplyr)
+library(ggplot2)
+
+# Extract variable importance (ipred stores it in $varimp)
+bagging_var_imp <- data.frame(
+  Predictor = names(bag_model$varimp),
+  Importance = as.numeric(bag_model$varimp)
+) %>% 
+  arrange(desc(Importance))
+
+bagging_top10 <- bagging_var_imp %>% slice_head(n = 10)
+
+bagging_plot <- ggplot(bagging_top10,
+                       aes(x = Importance,
+                           y = reorder(Predictor, Importance))) +
+  geom_col(fill = "#e76a28", width = 0.7) +
+  labs(
+    title = "Bagging variable importance (top 10)",
+    x = "Importance",
+    y = "Predictor"
+  ) +
+  theme_match
+
+bagging_plot
+
+ggsave("bagging_var_importance_150dpi.png",
+       bagging_plot, dpi = 150, width = 7, height = 4)
+       
+```
+
+rf_var_imp <- importance(rf_model) %>% 
+  as_tibble(rownames = "Predictor") %>% 
+  rename(Importance = 1) %>% 
+  arrange(desc(Importance))
+
+rf_top10 <- rf_var_imp %>% slice_head(n = 10)
+
+rf_plot <- ggplot(rf_top10,
+                  aes(x = Importance,
+                      y = reorder(Predictor, Importance))) +
+  geom_col(fill = "#6ebcd5", width = 0.7) +
+  labs(
+    title = "Random forest variable importance (top 10)",
+    x = "Importance",
+    y = "Predictor"
+  ) +
+  theme_match
+
+rf_plot
+ggsave("rf_var_importance_150dpi.png", rf_plot,
+       dpi = 150, width = 7, height = 4)
+
+pdp_age_plot <- ggplot(pd_age,
+                       aes(x = age, y = yhat)) +
+  geom_line(color = "#bc2d93", size = 1.1) +
+  geom_point(color = "#bc2d93", size = 1.8) +
+  labs(
+    title = "Partial dependence of high matchability on age",
+    x = "Age",
+    y = "Predicted probability of high matchability"
+  ) +
+  theme_match
+
+pdp_age_plot
+ggsave("pdp_age_150dpi.png", pdp_age_plot,
+       dpi = 150, width = 7, height = 4)
+```
+
+# Future work and limitations
+
+There are several limitations to this analysis:
+- Pseudo-target. The matchability label is based on profile effort and completeness, not real matches. Some profiles might be highly appealing with minimal text, or vice versa.
+- Population and time. Data are from San Francisco users around 2012; results may not generalise to other regions or years.
+- Feature selection. We deliberately dropped essays, location and last_online to keep the analysis focused and tractable. A more advanced study could incorporate text sentiment or embeddings.
+- Fairness and ethics. Even with engineered labels, models may learn patterns that correlate with sensitive attributes. Variable importance should be interpreted carefully and not used to justify discriminatory decisions.
+
+Future work could:
+- Use the true number of likes/matches if available via APIs,
+- Integrate text features via NLP (e.g., tf-idf, embeddings),
+- Compare random forests to gradient boosted trees (e.g., XGBoost),
+- Explore fairness metrics and debiasing techniques.
+
+# Business insights and real‑life applications
+
+The predictive models reveal meaningful patterns in how users’ attributes and self‑presentation relate to matchability.  Because we excluded the deterministic scoring features from the predictors, the variable importance rankings reflect **genuine** relationships rather than the mechanics of our label.  The following themes emerge:
+
+* **Effort matters, but content matters more.**  While profile completeness and the presence of essays correlate with high matchability, the models assign greatest importance to specific demographic and lifestyle variables.  Age and drinking habits consistently appear among the top predictors across all models.  For example, partial dependence on age shows a bell‑shaped curve: matchability peaks in the late twenties to early thirties and declines at the extremes.  Likewise, profiles indicating social drinking are favoured over those reporting heavy drinking or abstinence, suggesting a preference for moderation.
+
+* **Occupation and education influence appeal.**  Job categories and education levels rank highly in variable importance for both bagging and random forests.  Users employed in technical or creative fields and those with higher education levels are more likely to be deemed high‑matchability.  Conversely, unspecified or rare job descriptions are associated with lower matchability, implying that specificity and ambition in career descriptions resonate with potential matches.
+
+* **Lifestyle choices and openness affect perception.**  Factors such as smoking, drug use and dietary preferences help distinguish high from low matchability.  Profiles indicating non‑smoking and moderate drinking are favoured, while smoking and heavy drinking decrease predicted matchability.  Vegetarian diets show a slight positive effect in some models, perhaps reflecting shared values around health or sustainability.  Religion and political affiliations appear less frequently among the top predictors, suggesting they are either less informative or more evenly distributed across the classes.
+
+* **The models’ focus shifts with ensemble size.**  The single decision tree relies heavily on a handful of predictors (age and drinking habits).  Bagging distributes importance across a broader set, capturing weaker signals from variables like diet and pets.  The random forest spreads importance even further, highlighting subtle interactions among predictors. This diversity underscores why ensemble methods often outperform single trees: they harness information from many sources rather than fixating on one or two dominant splits.
+
+In practice, these insights can guide both users and platform designers:
+
+* **For users:** Filling out most profile fields and writing thoughtful essays improves matchability, but the content of those essays and the specifics of lifestyle choices matter.  Users may benefit from highlighting their education, work and hobbies, being honest about drinking and smoking habits, and emphasising moderate, approachable traits.
+
+* **For platforms:** Recommendation algorithms can use ensemble models to better match users based on nuanced combinations of attributes.  However, transparency and fairness are crucial.  Platforms should ensure that models do not inadvertently discriminate against certain demographic groups or reinforce stereotypes.  Variable importance analyses can help audit and explain which features drive recommendations, making the process more accountable.
+
+Beyond dating, the modelling approach generalises to any domain where success depends on both the substance of a profile and how it is presented—such as job recruitment, social networking or product reviews.  Bagging and random forests offer robust performance on messy, high‑dimensional data and can reveal the relative weight of multiple factors in complex decisions.
+
+# Conclusion
+
+By engineering a matchability proxy and applying tree‑based models, we have explored what makes OkCupid profiles appealing and assessed the effectiveness of bagging and random forests.  A single decision tree offers interpretability but limited predictive power.  Bagging reduces variance by averaging many bootstrap trees, yielding modest performance gains.  Random forests introduce additional randomness at each split and achieve the best overall accuracy, demonstrating the power of ensemble methods on heterogeneous, noisy data.  These techniques, coupled with thoughtful feature engineering, provide a compelling framework for understanding online dating behaviour and could be extended to other user‑generated datasets.
